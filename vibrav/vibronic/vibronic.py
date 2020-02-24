@@ -126,6 +126,152 @@ class Vibronic:
                                      'oscillator': oscil.reshape(-1,)})
         self.mag_oscil = df
 
+    def _run_vibronic_coupling(self, freqdx, dham_dq, ncomp, nstates, nstates_sf, so_props, fc, freq,
+                               out_file, property):
+        for fdx in freqdx:
+            vib_prop = np.zeros((2, ncomp, nstates, nstates), dtype=np.complex128)
+            vib_start = time()
+            if print_stdout:
+                print("*******************************************")
+                print("*     RUNNING VIBRATIONAL MODE: {:5d}     *".format(fdx+1))
+                print("*******************************************")
+            # assume that the hamiltonian values are real which they should be anyway
+            dham_dq_mode = np.real(grouped.get_group(fdx).values[:,:-1])
+            tdm_prefac = np.sqrt(planck_constant_au \
+                                    /(2*speed_of_light_au*freq[fdx]/Length['cm', 'au']))/(2*np.pi)
+            # iterate over all of the available components
+            for idx, (key, val) in enumerate(grouped_data):
+                start = time()
+                # get the values of the specific component
+                prop = val.drop('component', axis=1).values
+                self._check_size(prop, (nstates_sf, nstates_sf), 'prop_{}'.format(key))
+                # initialize arrays
+                dprop_dq_sf = np.zeros((nstates_sf, nstates_sf), dtype=np.float64) # spin-free deriv
+                dprop_dq_so = np.zeros((nstates, nstates), dtype=np.float64)       # spin-free deriv
+                                                                                   # extended to total
+                                                                                   # spin-orbit states
+                dprop_dq = np.zeros((nstates, nstates), dtype=np.complex128)       # spin-orbit deriv
+                # calculate everything
+                compute_d_dq_sf(nstates_sf, dham_dq_mode, prop, energies_sf, dprop_dq_sf)
+                sf_to_so(nstates_sf, nstates, multiplicity, dprop_dq_sf, dprop_dq_so)
+                compute_d_dq(nstates, eigvectors, dprop_dq_so, dprop_dq)
+                # check if the array is hermitian
+                # this one should be
+                dprop_dq *= tdm_prefac
+                if not ishermitian(dprop_dq) and property == 'electric_dipole':
+                    print("Falied at component {} in prop {}".format(key[0], property))
+                    raise ValueError("dprop_dq array is not Hermitian when it is expected to be")
+                ## reduce to the upper triangular elements
+                #dprop_dq = get_triu(dprop_dq)
+                #dprop_dq = dprop_dq.flatten()
+                # get the spin-orbit data for the specific component
+                so_prop = so_props.groupby('component').get_group(key).drop('component', axis=1).values
+                #so_prop = so_prop.flatten()
+                #_ = so_props.groupby('component').get_group(key).drop('component', axis=1).values
+                #so_prop = get_triu(_)
+                # apply a 2 state boltzmann distribution
+                # TODO: this needs to be carefully checked
+                #boltz_denom = 1+np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))
+                #boltz_plus = 1/boltz_denom
+                #boltz_minus = np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))/boltz_denom
+                # generate the full property vibronic states following equation S3 for the reference
+                if eq_cont:
+                    vib_prop_plus = fc*(so_prop + dprop_dq)
+                    vib_prop_minus = fc*(so_prop - dprop_dq)
+                else:
+                    vib_prop_plus = fc*dprop_dq
+                    vib_prop_minus = fc*-dprop_dq
+                # store in array
+                #vibronic_prop[fdx][0][idx_map_rev[key]-1] = vib_prop_minus.flatten()
+                #vibronic_prop[fdx][1][idx_map_rev[key]-1] = vib_prop_plus.flatten()
+                vib_prop[0][idx_map_rev[key]-1] = vib_prop_minus
+                vib_prop[1][idx_map_rev[key]-1] = vib_prop_plus
+                # fancy timing stuff
+                end = time() - start
+                iter_times.append(end)
+                # make an estimate of how much longer this will run for
+                # does not take into account anything beyond the construction of the derivatives
+                eta = timedelta(seconds=round(np.mean(iter_times)*(nmodes*ncomp-len(iter_times)), 0))
+                if print_stdout and verbose:
+                    print(" Computed {:3s} component in {:8.1f} s".format(key, end))
+                    print(" ETA:{:.>32s}".format(str(eta)))
+                    print("-"*37)
+            # calculate the oscillator strengths
+            evib = planck_constant_au * speed_of_light_au * freq[fdx]/Length['cm', 'au']
+            initial = np.repeat(range(nstates), nstates)+1
+            final = np.tile(range(nstates), nstates)+1
+            template = "{:6d}  {:6d}  {:>18.9E}  {:>18.9E}\n".format
+            for idx, (plus, minus) in enumerate(zip(*vibronic_prop[fdx])):
+                plus_T = plus.T.flatten()
+                real = np.real(plus_T)
+                imag = np.imag(plus_T)
+                dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
+                if not os.path.exists(dir_name):
+                    os.makedirs(dir_name, 0o755, exist_ok=True)
+                filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
+                with open(filename, 'w') as fn:
+                    fn.write('#{:>5s}  {:>6s}  {:>18s}  {:>18s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
+                    for i in range(nstates*nstates):
+                        fn.write(template(initial[i], final[i], real[i], imag[i]))
+                minus_T = minus.T.flatten()
+                real = np.real(minus_T)
+                imag = np.imag(minus_T)
+                dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'minus')
+                if not os.path.exists(dir_name):
+                    os.makedirs(dir_name, 0o755)
+                filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
+                with open(filename, 'w') as fn:
+                    fn.write('#{:>5s}  {:>6s}  {:>18s}  {:>18s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
+                    for i in range(nstates*nstates):
+                        fn.write(template(initial[i], final[i], real[i], imag[i]))
+            dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'minus')
+            with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
+                fn.write('# {} (atomic units)\n'.format(nstates))
+                energies = energies_so + (1./2.)*evib - energies_so[0]
+                energies[0] = (3./2.)*evib
+                for energy in energies:
+                    fn.write('{:.9E}\n'.format(energy))
+            dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
+            with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
+                fn.write('# {} (atomic units)\n'.format(nstates))
+                energies = energies_so + (3./2.)*evib - energies_so[0]
+                energies[0] = (1./2.)*evib
+                for energy in energies:
+                    fn.write('{:.9E}\n'.format(energy))
+            signs = ['minus', 'none', 'plus']
+            if (property == 'electric_dipole' or property == 'magnetic_dipole') and True:
+                if print_stdout and verbose:
+                    print(" Oscillator strengths for frequency {:5d}".format(fdx))
+                    print("-----------------------------------------")
+                # finally get the oscillator strengths from equation S12
+                to_drop = ['component', 'freqdx', 'sign', 'prop']
+                boltz_denom = 1+np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))
+                boltz_plus = 1/boltz_denom
+                boltz_minus = np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))/boltz_denom
+                for idx, val in enumerate([-1, 1]):
+                    if val == -1:
+                        boltz = boltz_minus
+                    else:
+                        boltz = boltz_plus
+                    absorption = np.zeros(nstates*nstates, dtype=np.float64)
+                    for component in vibronic_prop[fdx][idx]:
+                        absorption += abs2(component)
+                    energy = energies_so.reshape(-1,) - energies_so.reshape(-1,1) + val*evib
+                    energy = energy.flatten()
+                    self._check_size(energy, (nstates*nstates,), 'energy')
+                    self._check_size(absorption, (nstates*nstates,), 'absorption')
+                    oscil = boltz * 2./3. * compute_oscil_str(absorption, energy)
+                    #oscil[fdx][idx] = boltz * 2./3. * compute_oscil_str(absorption, energy)
+                    #delta_E[fdx][idx] = energy
+            else:
+                write_oscil = False
+                for idx, val in enumerate([-1, 1]):
+                    energy = energies_so.reshape(-1,) - energies_so.reshape(-1,1) + val*evib
+                    energy = energy.flatten()
+                    self._check_size(energy, (nstates*nstates,), 'energy')
+                    #delta_E[fdx][idx] = energy
+
+
     def vibronic_coupling(self, property, write_property=True, write_energy=True, write_oscil=True,
                           print_stdout=True, temp=298, eq_cont=True, verbose=False, sparse=True,
                           use_sqrt_rmass=True):
@@ -298,147 +444,9 @@ class Vibronic:
         vib_times = []
         grouped = dham_dq.groupby('freqdx')
         iter_times = []
-        for fdx in range(nmodes):
-            vib_prop = np.zeros((2, ncomp, nstates, nstates), dtype=np.complex128)
-            vib_start = time()
-            if print_stdout:
-                print("*******************************************")
-                print("*     RUNNING VIBRATIONAL MODE: {:5d}     *".format(fdx+1))
-                print("*******************************************")
-            # assume that the hamiltonian values are real which they should be anyway
-            dham_dq_mode = np.real(grouped.get_group(fdx).values[:,:-1])
-            tdm_prefac = np.sqrt(planck_constant_au \
-                                    /(2*speed_of_light_au*freq[fdx]/Length['cm', 'au']))/(2*np.pi)
-            # iterate over all of the available components
-            for idx, (key, val) in enumerate(grouped_data):
-                start = time()
-                # get the values of the specific component
-                prop = val.drop('component', axis=1).values
-                self._check_size(prop, (nstates_sf, nstates_sf), 'prop_{}'.format(key))
-                # initialize arrays
-                dprop_dq_sf = np.zeros((nstates_sf, nstates_sf), dtype=np.float64) # spin-free deriv
-                dprop_dq_so = np.zeros((nstates, nstates), dtype=np.float64)       # spin-free deriv
-                                                                                   # extended to total
-                                                                                   # spin-orbit states
-                dprop_dq = np.zeros((nstates, nstates), dtype=np.complex128)       # spin-orbit deriv
-                # calculate everything
-                compute_d_dq_sf(nstates_sf, dham_dq_mode, prop, energies_sf, dprop_dq_sf)
-                sf_to_so(nstates_sf, nstates, multiplicity, dprop_dq_sf, dprop_dq_so)
-                compute_d_dq(nstates, eigvectors, dprop_dq_so, dprop_dq)
-                # check if the array is hermitian
-                # this one should be
-                dprop_dq *= tdm_prefac
-                if not ishermitian(dprop_dq) and property == 'electric_dipole':
-                    print("Falied at component {} in prop {}".format(key[0], property))
-                    raise ValueError("dprop_dq array is not Hermitian when it is expected to be")
-                ## reduce to the upper triangular elements
-                #dprop_dq = get_triu(dprop_dq)
-                #dprop_dq = dprop_dq.flatten()
-                # get the spin-orbit data for the specific component
-                so_prop = so_props.groupby('component').get_group(key).drop('component', axis=1).values
-                #so_prop = so_prop.flatten()
-                #_ = so_props.groupby('component').get_group(key).drop('component', axis=1).values
-                #so_prop = get_triu(_)
-                # apply a 2 state boltzmann distribution
-                # TODO: this needs to be carefully checked
-                #boltz_denom = 1+np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))
-                #boltz_plus = 1/boltz_denom
-                #boltz_minus = np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))/boltz_denom
-                # generate the full property vibronic states following equation S3 for the reference
-                if eq_cont:
-                    vib_prop_plus = fc*(so_prop + dprop_dq)
-                    vib_prop_minus = fc*(so_prop - dprop_dq)
-                else:
-                    vib_prop_plus = fc*dprop_dq
-                    vib_prop_minus = fc*-dprop_dq
-                # store in array
-                vibronic_prop[fdx][0][idx_map_rev[key]-1] = vib_prop_minus.flatten()
-                vibronic_prop[fdx][1][idx_map_rev[key]-1] = vib_prop_plus.flatten()
-                vib_prop[0][idx_map_rev[key]-1] = vib_prop_minus
-                vib_prop[1][idx_map_rev[key]-1] = vib_prop_plus
-                # fancy timing stuff
-                end = time() - start
-                iter_times.append(end)
-                # make an estimate of how much longer this will run for
-                # does not take into account anything beyond the construction of the derivatives
-                eta = timedelta(seconds=round(np.mean(iter_times)*(nmodes*ncomp-len(iter_times)), 0))
-                if print_stdout and verbose:
-                    print(" Computed {:3s} component in {:8.1f} s".format(key, end))
-                    print(" ETA:{:.>32s}".format(str(eta)))
-                    print("-"*37)
-            # calculate the oscillator strengths
-            evib = planck_constant_au * speed_of_light_au * freq[fdx]/Length['cm', 'au']
-            initial = np.repeat(range(nstates), nstates)+1
-            final = np.tile(range(nstates), nstates)+1
-            template = "{:6d}  {:6d}  {:>18.9E}  {:>18.9E}\n".format
-            for idx, (plus, minus) in enumerate(zip(*vibronic_prop[fdx])):
-                plus_T = plus.T.flatten()
-                real = np.real(plus_T)
-                imag = np.imag(plus_T)
-                dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
-                if not os.path.exists(dir_name):
-                    os.makedirs(dir_name, 0o755, exist_ok=True)
-                filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
-                with open(filename, 'w') as fn:
-                    fn.write('#{:>5s}  {:>6s}  {:>18s}  {:>18s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
-                    for i in range(nstates*nstates):
-                        fn.write(template(initial[i], final[i], real[i], imag[i]))
-                minus_T = minus.T.flatten()
-                real = np.real(minus_T)
-                imag = np.imag(minus_T)
-                dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'minus')
-                if not os.path.exists(dir_name):
-                    os.makedirs(dir_name, 0o755)
-                filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
-                with open(filename, 'w') as fn:
-                    fn.write('#{:>5s}  {:>6s}  {:>10s}  {:>10s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
-                    for i in range(nstates*nstates):
-                        fn.write(template(initial[i], final[i], real[i], imag[i]))
-            dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'minus')
-            with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
-                fn.write('# {} (atomic units)\n'.format(nstates))
-                energies = energies_so + (1./2.)*evib - energies_so[0]
-                energies[0] = (3./2.)*evib
-                for energy in energies:
-                    fn.write('{:.9E}\n'.format(energy))
-            dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
-            with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
-                fn.write('# {} (atomic units)\n'.format(nstates))
-                energies = energies_so + (3./2.)*evib - energies_so[0]
-                energies[0] = (1./2.)*evib
-                for energy in energies:
-                    fn.write('{:.9E}\n'.format(energy))
-            signs = ['minus', 'none', 'plus']
-            if (property == 'electric_dipole' or property == 'magnetic_dipole') and write_oscil:
-                if print_stdout and verbose:
-                    print(" Computing the oscillator strengths")
-                    print("-----------------------------------")
-                # finally get the oscillator strengths from equation S12
-                to_drop = ['component', 'freqdx', 'sign', 'prop']
-                boltz_denom = 1+np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))
-                boltz_plus = 1/boltz_denom
-                boltz_minus = np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))/boltz_denom
-                for idx, val in enumerate([-1, 1]):
-                    if val == -1:
-                        boltz = boltz_minus
-                    else:
-                        boltz = boltz_plus
-                    absorption = np.zeros(nstates*nstates, dtype=np.float64)
-                    for component in vibronic_prop[fdx][idx]:
-                        absorption += abs2(component)
-                    energy = energies_so.reshape(-1,) - energies_so.reshape(-1,1) + val*evib
-                    energy = energy.flatten()
-                    self._check_size(energy, (nstates*nstates,), 'energy')
-                    self._check_size(absorption, (nstates*nstates,), 'absorption')
-                    oscil[fdx][idx] = boltz * 2./3. * compute_oscil_str(absorption, energy)
-                    delta_E[fdx][idx] = energy
-            else:
-                write_oscil = False
-                for idx, val in enumerate([-1, 1]):
-                    energy = energies_so.reshape(-1,) - energies_so.reshape(-1,1) + val*evib
-                    energy = energy.flatten()
-                    self._check_size(energy, (nstates*nstates,), 'energy')
-                    delta_E[fdx][idx] = energy
+        self._run_vibronic_coupling(freqdx=range(nmodes), dham_dq=grouped, ncomp=ncomp, nstates=nstates,
+                                    nstates_sf=nstates_sf, so_props=so_props, freq=freq,
+                                    out_file=out_file, property=property)
         # write the values of the vibronic property
         out_dir = 'vibronic-outputs'
         nstates_vib = 2*nmodes*nstates
