@@ -35,7 +35,8 @@ class Vibronic:
                         'number_of_modes': int, 'zero_order_file': str,
                         'oscillator_spin_states': int}
     _default_inputs = {'sf_energies_file': None, 'so_energies_file': None, 'angmom_file': 'angmom',
-                       'dipole_file': 'dipole', 'spin_file': 'spin', 'quadrupole_file': 'quadrupole'}
+                       'dipole_file': 'dipole', 'spin_file': 'spin', 'quadrupole_file': 'quadrupole',
+                       'degen_delta': 1e-5}
     @staticmethod
     def _check_size(data, size, var_name, dataframe=False):
         '''
@@ -73,6 +74,33 @@ class Vibronic:
     @staticmethod
     def boltz_factor(energies_so):
         raise NotImplementedError("Coming Soon!!")
+
+    @staticmethod
+    def determine_degeneracy(data_df, degen_delta, rtol=1e-12, numpy=True):
+        degen_states = []
+        idx = 0
+        if not numpy:
+            sorted = data_df.sort_values()
+            index = sorted.index.values
+            data = sorted.values
+        else:
+            df = pd.Series(data_df)
+            sorted = df.sort_values()
+            index = sorted.index.values
+            data = sorted.values
+        while idx < data.shape[0]:
+            degen = np.isclose(data[idx], data, atol=degen_delta, rtol=rtol)
+            ddx = np.where(degen)[0]
+            degen_vals = data[ddx]
+            degen_index = index[ddx]
+            mean = np.mean(degen_vals)
+            idx += ddx.shape[0]
+            df = pd.DataFrame.from_dict({'values': [mean], 'degen': [ddx.shape[0]]})
+            found = np.transpose(degen_index)
+            df['index'] = [found]
+            degen_states.append(df)
+        degeneracy = pd.concat(degen_states, ignore_index=True)
+        return degeneracy
 
     def magnetic_oscillator(self):
         raise NotImplementedError("Needs to be fixed!!!")
@@ -127,7 +155,10 @@ class Vibronic:
         self.mag_oscil = df
 
     def _run_vibronic_coupling(self, freqdx, dham_dq, ncomp, nstates, nstates_sf, so_props, fc, freq,
-                               out_file, property):
+                               out_file, propertyenergies_so, energies_sf):
+        degeneracy = self.determine_degeneracy(energies_so, config.degen_delta)
+        gs_degeneracy = degeneracy.loc[0, 'degen']
+        if store_gs_degen: self.gs_degeneracy = gs_degeneracy
         for fdx in freqdx:
             vib_prop = np.zeros((2, ncomp, nstates, nstates), dtype=np.complex128)
             vib_start = time()
@@ -182,8 +213,8 @@ class Vibronic:
                     vib_prop_plus = fc*dprop_dq
                     vib_prop_minus = fc*-dprop_dq
                 # store in array
-                #vibronic_prop[fdx][0][idx_map_rev[key]-1] = vib_prop_minus.flatten()
-                #vibronic_prop[fdx][1][idx_map_rev[key]-1] = vib_prop_plus.flatten()
+                vibronic_prop[fdx][0][idx_map_rev[key]-1] = vib_prop_minus.flatten()
+                vibronic_prop[fdx][1][idx_map_rev[key]-1] = vib_prop_plus.flatten()
                 vib_prop[0][idx_map_rev[key]-1] = vib_prop_minus
                 vib_prop[1][idx_map_rev[key]-1] = vib_prop_plus
                 # fancy timing stuff
@@ -191,7 +222,7 @@ class Vibronic:
                 iter_times.append(end)
                 # make an estimate of how much longer this will run for
                 # does not take into account anything beyond the construction of the derivatives
-                eta = timedelta(seconds=round(np.mean(iter_times)*(nmodes*ncomp-len(iter_times)), 0))
+                eta = timedelta(seconds=round(np.mean(iter_times)*(nselected*ncomp-len(iter_times)), 0))
                 if print_stdout and verbose:
                     print(" Computed {:3s} component in {:8.1f} s".format(key, end))
                     print(" ETA:{:.>32s}".format(str(eta)))
@@ -201,48 +232,49 @@ class Vibronic:
             initial = np.repeat(range(nstates), nstates)+1
             final = np.tile(range(nstates), nstates)+1
             template = "{:6d}  {:6d}  {:>18.9E}  {:>18.9E}\n".format
-            for idx, (plus, minus) in enumerate(zip(*vibronic_prop[fdx])):
-                plus_T = plus.T.flatten()
-                real = np.real(plus_T)
-                imag = np.imag(plus_T)
-                dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
-                if not os.path.exists(dir_name):
-                    os.makedirs(dir_name, 0o755, exist_ok=True)
-                filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
-                with open(filename, 'w') as fn:
-                    fn.write('#{:>5s}  {:>6s}  {:>18s}  {:>18s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
-                    for i in range(nstates*nstates):
-                        fn.write(template(initial[i], final[i], real[i], imag[i]))
-                minus_T = minus.T.flatten()
-                real = np.real(minus_T)
-                imag = np.imag(minus_T)
+            if write_property:
+                for idx, (plus, minus) in enumerate(zip(*vibronic_prop[fdx])):
+                    plus_T = plus.T.flatten()
+                    real = np.real(plus_T)
+                    imag = np.imag(plus_T)
+                    dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
+                    if not os.path.exists(dir_name):
+                        os.makedirs(dir_name, 0o755, exist_ok=True)
+                    filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
+                    with open(filename, 'w') as fn:
+                        fn.write('#{:>5s}  {:>6s}  {:>18s}  {:>18s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
+                        for i in range(nstates*nstates):
+                            fn.write(template(initial[i], final[i], real[i], imag[i]))
+                    minus_T = minus.T.flatten()
+                    real = np.real(minus_T)
+                    imag = np.imag(minus_T)
+                    dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'minus')
+                    if not os.path.exists(dir_name):
+                        os.makedirs(dir_name, 0o755)
+                    filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
+                    with open(filename, 'w') as fn:
+                        fn.write('#{:>5s}  {:>6s}  {:>10s}  {:>10s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
+                        for i in range(nstates*nstates):
+                            fn.write(template(initial[i], final[i], real[i], imag[i]))
                 dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'minus')
-                if not os.path.exists(dir_name):
-                    os.makedirs(dir_name, 0o755)
-                filename = os.path.join(dir_name, out_file+'-{}.txt'.format(idx+1))
-                with open(filename, 'w') as fn:
-                    fn.write('#{:>5s}  {:>6s}  {:>18s}  {:>18s}\n'.format('NROW', 'NCOL', 'REAL', 'IMAG'))
-                    for i in range(nstates*nstates):
-                        fn.write(template(initial[i], final[i], real[i], imag[i]))
-            dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'minus')
-            with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
-                fn.write('# {} (atomic units)\n'.format(nstates))
-                energies = energies_so + (1./2.)*evib - energies_so[0]
-                energies[0] = (3./2.)*evib
-                for energy in energies:
-                    fn.write('{:.9E}\n'.format(energy))
-            dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
-            with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
-                fn.write('# {} (atomic units)\n'.format(nstates))
-                energies = energies_so + (3./2.)*evib - energies_so[0]
-                energies[0] = (1./2.)*evib
-                for energy in energies:
-                    fn.write('{:.9E}\n'.format(energy))
+                with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
+                    fn.write('# {} (atomic units)\n'.format(nstates))
+                    energies = energies_so + (1./2.)*evib - energies_so[0]
+                    energies[range(gs_degeneracy)] = (3./2.)*evib
+                    for energy in energies:
+                        fn.write('{:.9E}\n'.format(energy))
+                dir_name = os.path.join('vib'+str(fdx+1).zfill(3), 'plus')
+                with open(os.path.join(dir_name, 'energies.txt'), 'w') as fn:
+                    fn.write('# {} (atomic units)\n'.format(nstates))
+                    energies = energies_so + (3./2.)*evib - energies_so[0]
+                    energies[range(gs_degeneracy)] = (1./2.)*evib
+                    for energy in energies:
+                        fn.write('{:.9E}\n'.format(energy))
             signs = ['minus', 'none', 'plus']
-            if (property == 'electric_dipole' or property == 'magnetic_dipole') and True:
+            if (property == 'electric_dipole' or property == 'magnetic_dipole') and write_oscil:
                 if print_stdout and verbose:
-                    print(" Oscillator strengths for frequency {:5d}".format(fdx))
-                    print("-----------------------------------------")
+                    print(" Computing the oscillator strengths")
+                    print("-----------------------------------")
                 # finally get the oscillator strengths from equation S12
                 to_drop = ['component', 'freqdx', 'sign', 'prop']
                 boltz_denom = 1+np.exp(-freq[fdx]/(boltz_constant*Energy['J', 'cm^-1']*temp))
@@ -260,21 +292,20 @@ class Vibronic:
                     energy = energy.flatten()
                     self._check_size(energy, (nstates*nstates,), 'energy')
                     self._check_size(absorption, (nstates*nstates,), 'absorption')
-                    oscil = boltz * 2./3. * compute_oscil_str(absorption, energy)
-                    #oscil[fdx][idx] = boltz * 2./3. * compute_oscil_str(absorption, energy)
-                    #delta_E[fdx][idx] = energy
+                    oscil[fdx][idx] = boltz * 2./3. * compute_oscil_str(absorption, energy)
+                    delta_E[fdx][idx] = energy
             else:
                 write_oscil = False
                 for idx, val in enumerate([-1, 1]):
                     energy = energies_so.reshape(-1,) - energies_so.reshape(-1,1) + val*evib
                     energy = energy.flatten()
                     self._check_size(energy, (nstates*nstates,), 'energy')
-                    #delta_E[fdx][idx] = energy
+                    delta_E[fdx][idx] = energy
 
 
     def vibronic_coupling(self, property, write_property=True, write_energy=True, write_oscil=True,
                           print_stdout=True, temp=298, eq_cont=True, verbose=False, sparse=True,
-                          use_sqrt_rmass=True):
+                          use_sqrt_rmass=True, store_gs_degen=True, select_fdx=-1):
         '''
         Vibronic coupling method to calculate the vibronic coupling by the equations as given
         in reference J. Phys. Chem. Lett. 2018, 9, 887-894. This code follows a similar structure
@@ -346,23 +377,46 @@ class Vibronic:
         # read the hamiltonian files in each of the confg??? directories
         # it is assumed that the directories are named confg with a 3-fold padded number (000)
         padding = 3
-        nmodes = int(config.number_of_modes)
         plus_matrix = []
         minus_matrix = []
-        for idx in range(1, nmodes+1):
-            plus_matrix.append(open_txt(os.path.join('confg'+str(idx).zfill(padding),
-                                                          'ham-sf.txt')))
-            minus_matrix.append(open_txt(os.path.join('confg'+str(idx+nmodes).zfill(padding),
-                                                           'ham-sf.txt')))
+        found_modes = []
+        if select_fdx == -1:
+            nmodes = config.number_of_modes
+            freq_range = list(range(1, nmodes+1))
+        else:
+            if isinstance(select_fdx, int): select_fdx = [select_fdx]
+            freq_range = np.array(select_fdx) + 1
+            nmodes = config.number_of_modes
+        nselected = len(freq_range)
+        for idx in freq_range:
+            try:
+                plus = open_txt(os.path.join('confg'+str(idx).zfill(padding), 'ham-sf.txt'))
+                try:
+                    minus = open_txt(os.path.join('confg'+str(idx+nmodes).zfill(padding),
+                                                  'ham-sf.txt'))
+                except FileNotFoundError:
+                    print("Could not find ham-sf.txt file for in directory " \
+                         +'confg'+str(idx+nmodes).zfill(padding) \
+                         +"\nIgnoring frequency index {}".format(idx))
+                    continue
+            except FileNotFoundError:
+                print("Could not find ham-sf.txt file for in directory " \
+                     +'confg'+str(idx).zfill(padding) \
+                     +"\nIgnoring frequency index {}".format(idx))
+                continue
+            plus_matrix.append(plus)
+            minus_matrix.append(minus)
+            found_modes.append(idx-1)
         ham_plus = pd.concat(plus_matrix, ignore_index=True)
         ham_minus = pd.concat(minus_matrix, ignore_index=True)
         dham_dq = ham_plus - ham_minus
-        self._check_size(dham_dq, (nstates_sf*nmodes, nstates_sf), 'dham_dq')
+        self._check_size(dham_dq, (nstates_sf*nselected, nstates_sf), 'dham_dq')
         # TODO: this division by the sqrt of the mass needs to be verified
         #       left as is for the time being as it was in the original code
-        sf_sqrt_rmass = np.repeat(np.sqrt(rmass.values*Mass['u', 'au_mass']),
+        sf_sqrt_rmass = np.repeat(np.sqrt(rmass.loc[found_modes].values \
+                                  *Mass['u', 'au_mass']),
                                   nstates_sf).reshape(-1, 1)
-        sf_delta = np.repeat(delta.values, nstates_sf).reshape(-1, 1)
+        sf_delta = np.repeat(delta.loc[found_modes].values, nstates_sf).reshape(-1, 1)
         if use_sqrt_rmass:
             to_dq = 2 * sf_sqrt_rmass * sf_delta
         else:
@@ -370,7 +424,7 @@ class Vibronic:
         # convert to normal coordinates
         dham_dq = dham_dq / to_dq
         # add a frequency index reference
-        dham_dq['freqdx'] = np.repeat(range(nmodes), nstates_sf)
+        dham_dq['freqdx'] = np.repeat(found_modes, nstates_sf)
         # TODO
         # TODO: it would be really cool if we could just input a list of properties to compute
         #       and the program will take care of the rest
@@ -378,14 +432,28 @@ class Vibronic:
         ed = Output(config.zero_order_file)
         # parse the energies from the output is the energy files are not available
         if config.sf_energies_file is not None:
-            energies_sf = pd.read_csv(config.sf_energies_file, header=None,
-                                      comment='#').values.reshape(-1,)
+            try:
+                energies_sf = pd.read_csv(config.sf_energies_file, header=None,
+                                          comment='#').values.reshape(-1,)
+            except FileNotFoundError:
+                print("The file {} was not found. Reading ".format(config.sf_energies_file) \
+                     +"spin-free energies direclty from the " \
+                     +"zero order output file {}".format(config.zero_order_file))
+                ed.parse_sf_energy()
+                energies_sf = ed.sf_energy['energy'].values
         else:
             ed.parse_sf_energy()
             energies_sf = ed.sf_energy['energy'].values
         if config.so_energies_file is not None:
-            energies_so = pd.read_csv(config.so_energies_file, header=None,
-                                      comment='#').values.reshape(-1,)
+            try:
+                energies_so = pd.read_csv(config.so_energies_file, header=None,
+                                          comment='#').values.reshape(-1,)
+            except FileNotFoundError:
+                print("The file {} was not found. Reading ".format(config.so_energies_file) \
+                     +"spin-orbit energies direclty from the " \
+                     +"zero order output file {}".format(config.zero_order_file))
+                ed.parse_so_energy()
+                energies_so = ed.so_energy['energy'].values
         else:
             ed.parse_so_energy()
             energies_so = ed.so_energy['energy'].values
@@ -432,9 +500,9 @@ class Vibronic:
         # number of elements in upper triangular matrices for each vibronic block including the diagonal
         upper_nelem = int(nstates*(nstates+1)/2)
         # allocate memory for arrays
-        oscil = np.zeros((nmodes, 2, nstates*nstates), dtype=np.float64)
-        delta_E = np.zeros((nmodes, 2, nstates*nstates), dtype=np.float64)
-        vibronic_prop = np.zeros((nmodes, 2, ncomp, nstates*nstates), dtype=np.complex128)
+        oscil = np.zeros((nselected, 2, nstates*nstates), dtype=np.float64)
+        delta_E = np.zeros((nselected, 2, nstates*nstates), dtype=np.float64)
+        vibronic_prop = np.zeros((nselected, 2, ncomp, nstates*nstates), dtype=np.complex128)
         #oscil = np.zeros((nmodes, 2, upper_nelem), dtype=np.float64)
         #delta_E = np.zeros((nmodes, 2, upper_nelem), dtype=np.float64)
         #vibronic_prop = np.zeros((nmodes, 2, ncomp, upper_nelem), dtype=np.complex128)
@@ -444,15 +512,14 @@ class Vibronic:
         vib_times = []
         grouped = dham_dq.groupby('freqdx')
         iter_times = []
-        self._run_vibronic_coupling(freqdx=range(nmodes), dham_dq=grouped, ncomp=ncomp, nstates=nstates,
+        self._run_vibronic_coupling(freqdx=found_modes, dham_dq=grouped, ncomp=ncomp, nstates=nstates,
                                     nstates_sf=nstates_sf, so_props=so_props, freq=freq,
-                                    out_file=out_file, property=property)
+                                    out_file=out_file, property=property, energies_so=energies_so,
+                                    energies_sf=energies_sf)
         # write the values of the vibronic property
         out_dir = 'vibronic-outputs'
-        nstates_vib = 2*nmodes*nstates
-        #print(vibronic_prop[0][0][0][:20])
-        #print(vibronic_prop[0][1][0][:20])
-        if write_property:
+        nstates_vib = 2*nselected*nstates
+        if False:
             write_energy = True
             template = "{:6d}  {:6d}  {:+.9E}  {:+.9E}\n"
             if print_stdout:
@@ -619,7 +686,7 @@ class Vibronic:
                 # outside of for loops as this will go from 0 to the number of vibronic states
                 initial = 0
                 # iterate over the normal modes
-                for fdx in range(nmodes):
+                for fdx in found_modes:
                     # iterate over the plus and minus vibronic states around the
                     # electronic excitation
                     for idx, val in enumerate(['minus', 'plus']):
@@ -640,7 +707,7 @@ class Vibronic:
                             initial += 1
                 if print_stdout:
                     time_taken = timedelta(seconds=round(time()-start, 0))
-                    print("Wrote {} lines to {} in {}".format(int(2*nmodes*nstates*(nstates+1)/2),
+                    print("Wrote {} lines to {} in {}".format(int(2*nselected*nstates*nstates),
                                                               filename, str(time_taken)))
             if print_stdout:
                 print('='*68)
